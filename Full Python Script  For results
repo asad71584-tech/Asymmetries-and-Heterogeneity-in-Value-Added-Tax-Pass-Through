@@ -1,0 +1,1208 @@
+# ============================================================
+# VAT PASS-THROUGH ANALYSIS SCRIPT
+# Germany temporary VAT cut 2020
+
+# Project:
+# Asymmetries and Heterogeneity in Value-Added Tax Pass-Through:
+# Evidence from Germany's Temporary VAT Cut
+
+
+# ============================================================
+# 0. IMPORT LIBRARIES
+# ============================================================
+
+import os
+import re
+import warnings
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 1. FILE PATH
+# ============================================================
+
+INPUT_FILE = r"D:\MSEP\4th\Pub. Eco. Reseach M\Data\3rd\meat, bread, milk cloths...xlsx"
+
+OUTPUT_FOLDER = Path(INPUT_FILE).parent / "VAT_pass_through_text_results"
+OUTPUT_FOLDER.mkdir(exist_ok=True)
+
+OUTPUT_TXT = OUTPUT_FOLDER / "VAT_pass_through_FINAL_RESULTS.txt"
+
+
+# ============================================================
+# 2. PROJECT SETTINGS
+# ============================================================
+
+COUNTRIES_KEEP = [
+    "Germany",
+    "Austria",
+    "France",
+    "Netherlands",
+    "Belgium"
+]
+
+TREATED_COUNTRY = "Germany"
+
+CONTROL_COUNTRIES = [
+    "Austria",
+    "France",
+    "Netherlands",
+    "Belgium"
+]
+
+CORE_FOOD_CATEGORIES = [
+    "Bread and cereals",
+    "Bread",
+    "Meat",
+    "Milk, cheese and eggs"
+]
+
+COMPARISON_CATEGORY = "Clothing"
+
+ALL_ANALYSIS_CATEGORIES = CORE_FOOD_CATEGORIES + [COMPARISON_CATEGORY]
+
+EXCLUDED_FROM_MAIN = [
+    "Fruit",
+    "Vegetables"
+]
+
+ALL_SHEETS_TO_READ = ALL_ANALYSIS_CATEGORIES + EXCLUDED_FROM_MAIN
+
+START_DATE = "2018-01"
+END_DATE = "2021-12"
+
+VAT_CUT_START = "2020-07"
+VAT_CUT_END = "2020-12"
+POST_START = "2021-01"
+
+EVENT_REFERENCE_MONTH = "2020-06"
+
+
+# ============================================================
+# 3. TEXT OUTPUT HELPERS
+# ============================================================
+
+all_text_output = []
+
+def add_section(title, content=""):
+    line = "\n" + "=" * 95 + "\n"
+    text = f"{line}{title}\n{line}{content}\n"
+    print(text)
+    all_text_output.append(text)
+
+
+def add_table(title, df, max_rows=None):
+    if df is None or len(df) == 0:
+        content = "No result available."
+    else:
+        if max_rows is not None:
+            content = df.head(max_rows).to_string(index=False)
+        else:
+            content = df.to_string(index=False)
+
+    add_section(title, content)
+
+
+def safe_round_df(df, cols, digits=6):
+    temp = df.copy()
+    for col in cols:
+        if col in temp.columns:
+            temp[col] = pd.to_numeric(temp[col], errors="coerce").round(digits)
+    return temp
+
+
+# ============================================================
+# 4. BASIC CLEANING HELPERS
+# ============================================================
+
+def normalize_country_name(x):
+    if pd.isna(x):
+        return x
+
+    value = str(x).strip()
+    low = value.lower()
+
+    if low == "germany" or "germany" in low or "deutschland" in low or value in ["DE", "DEU"]:
+        return "Germany"
+
+    if low == "austria" or "austria" in low or "österreich" in low or value in ["AT", "AUT"]:
+        return "Austria"
+
+    if low == "france" or "france" in low or value in ["FR", "FRA"]:
+        return "France"
+
+    if low == "netherlands" or "netherlands" in low or "nederland" in low or value in ["NL", "NLD"]:
+        return "Netherlands"
+
+    if low == "belgium" or "belgium" in low or "belgique" in low or "belgië" in low or value in ["BE", "BEL"]:
+        return "Belgium"
+
+    return value
+
+
+def parse_month_value(x):
+    if pd.isna(x):
+        return None
+
+    if isinstance(x, (pd.Timestamp, datetime)):
+        if 2000 <= x.year <= 2035:
+            return pd.Period(x, freq="M")
+
+    if isinstance(x, np.datetime64):
+        dt = pd.to_datetime(x)
+        if 2000 <= dt.year <= 2035:
+            return pd.Period(dt, freq="M")
+
+    text = str(x).strip()
+
+    if text == "" or text.lower() in ["nan", "none"]:
+        return None
+
+    if re.match(r"^\d{4}-\d{2}$", text):
+        return pd.Period(text, freq="M")
+
+    if re.match(r"^\d{4}M\d{2}$", text):
+        return pd.Period(text.replace("M", "-"), freq="M")
+
+    if re.match(r"^\d{4}/\d{2}$", text):
+        return pd.Period(text.replace("/", "-"), freq="M")
+
+    found = re.search(r"(20\d{2})[-/M](\d{2})", text)
+    if found:
+        year = found.group(1)
+        month = found.group(2)
+        if 1 <= int(month) <= 12:
+            return pd.Period(f"{year}-{month}", freq="M")
+
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.notna(dt):
+        if 2000 <= dt.year <= 2035:
+            return pd.Period(dt, freq="M")
+
+    return None
+
+
+def clean_number(x):
+    if pd.isna(x):
+        return np.nan
+
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+
+    text = str(x).strip()
+
+    if text == "" or text.lower() in ["nan", "none", ":"]:
+        return np.nan
+
+    text = text.replace(",", ".")
+
+    found = re.search(r"-?\d+\.?\d*", text)
+    if found:
+        return float(found.group(0))
+
+    return np.nan
+
+
+# ============================================================
+# 5. EXACT EUROSTAT SHEET READER
+# ============================================================
+
+def read_eurostat_sheet_exact(excel_file, sheet_name):
+    """
+    Reads your exact Excel layout.
+
+    Structure found from debug:
+    - row 8 contains TIME and months
+    - row 9 contains GEO (Labels)
+    - rows 10-14 contain Belgium, Germany, France, Netherlands, Austria
+    - months are in columns like 1, 3, 5, 7...
+    - blank columns are between data columns
+    """
+
+    raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+    raw = raw.dropna(how="all")
+    raw = raw.dropna(axis=1, how="all")
+    raw = raw.reset_index(drop=True)
+
+    min_month = pd.Period(START_DATE, freq="M")
+    max_month = pd.Period(END_DATE, freq="M")
+
+    # ------------------------------------------------------------
+    # Find row containing TIME and months
+    # ------------------------------------------------------------
+
+    time_row = None
+    month_cols = {}
+    best_month_count = 0
+
+    for r in range(raw.shape[0]):
+        temp_month_cols = {}
+
+        for c in range(raw.shape[1]):
+            m = parse_month_value(raw.iloc[r, c])
+            if m is not None and min_month <= m <= max_month:
+                temp_month_cols[c] = m
+
+        if len(temp_month_cols) > best_month_count:
+            best_month_count = len(temp_month_cols)
+            time_row = r
+            month_cols = temp_month_cols
+
+    if time_row is None or len(month_cols) == 0:
+        raise ValueError(f"No month row found in sheet: {sheet_name}")
+
+    # ------------------------------------------------------------
+    # Find country rows
+    # ------------------------------------------------------------
+
+    country_rows = {}
+
+    for r in range(time_row + 1, raw.shape[0]):
+        for c in range(raw.shape[1]):
+            country = normalize_country_name(raw.iloc[r, c])
+            if country in COUNTRIES_KEEP:
+                country_rows[r] = country
+                break
+
+    if len(country_rows) == 0:
+        raise ValueError(f"No country rows found in sheet: {sheet_name}")
+
+    # ------------------------------------------------------------
+    # Build long panel
+    # ------------------------------------------------------------
+
+    rows = []
+
+    for r, country in country_rows.items():
+        for c, month in month_cols.items():
+            value = clean_number(raw.iloc[r, c])
+
+            if pd.notna(value):
+                rows.append({
+                    "country": country,
+                    "month": month,
+                    "category": sheet_name.strip(),
+                    "hicp_index": value
+                })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise ValueError(f"No numeric HICP values found in sheet: {sheet_name}")
+
+    print(
+        f"OK: {sheet_name} | time row: {time_row} | months found: {len(month_cols)} | "
+        f"countries found: {len(country_rows)} | observations: {len(df)}"
+    )
+
+    return df
+
+
+# ============================================================
+# 6. REGRESSION HELPERS
+# ============================================================
+
+def significance_stars(p):
+    if pd.isna(p):
+        return ""
+    if p < 0.01:
+        return "***"
+    if p < 0.05:
+        return "**"
+    if p < 0.10:
+        return "*"
+    return ""
+
+
+def regression_key_table(model, model_name):
+    keys = [
+        "germany_during",
+        "germany_post",
+        "germany_during_bread",
+        "germany_post_bread",
+        "germany_during_food",
+        "germany_post_food"
+    ]
+
+    rows = []
+
+    for key in keys:
+        if key in model.params.index:
+            p = model.pvalues.get(key, np.nan)
+
+            rows.append({
+                "model": model_name,
+                "variable": key,
+                "coef": model.params.get(key, np.nan),
+                "std_error": model.bse.get(key, np.nan),
+                "t_value": model.tvalues.get(key, np.nan),
+                "p_value": p,
+                "significance": significance_stars(p)
+            })
+
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        result = safe_round_df(result, ["coef", "std_error", "t_value", "p_value"], 6)
+
+    return result
+
+
+def full_regression_table(model, model_name):
+    rows = []
+
+    for var in model.params.index:
+        p = model.pvalues.get(var, np.nan)
+
+        rows.append({
+            "model": model_name,
+            "variable": var,
+            "coef": model.params.get(var, np.nan),
+            "std_error": model.bse.get(var, np.nan),
+            "t_value": model.tvalues.get(var, np.nan),
+            "p_value": p,
+            "significance": significance_stars(p)
+        })
+
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        result = safe_round_df(result, ["coef", "std_error", "t_value", "p_value"], 6)
+
+    return result
+
+
+def run_ols(formula, data, model_name):
+    try:
+        model = smf.ols(formula=formula, data=data).fit(cov_type="HC1")
+        return model
+    except Exception as e:
+        add_section(f"ERROR IN MODEL: {model_name}", str(e))
+        return None
+
+
+# ============================================================
+# 7. START ANALYSIS
+# ============================================================
+
+print("SCRIPT STARTED")
+
+add_section(
+    "STARTING ANALYSIS",
+    f"""
+Input file:
+{INPUT_FILE}
+
+Output text file:
+{OUTPUT_TXT}
+"""
+)
+
+if not os.path.exists(INPUT_FILE):
+    raise FileNotFoundError(f"File not found: {INPUT_FILE}")
+
+xls = pd.ExcelFile(INPUT_FILE)
+
+add_section("AVAILABLE SHEETS", "\n".join(xls.sheet_names))
+
+selected_sheets = [
+    s for s in xls.sheet_names
+    if s.strip() in ALL_SHEETS_TO_READ
+]
+
+add_section("SELECTED SHEETS", "\n".join(selected_sheets))
+
+all_panels = []
+
+for sheet in selected_sheets:
+    try:
+        sheet_panel = read_eurostat_sheet_exact(INPUT_FILE, sheet)
+        all_panels.append(sheet_panel)
+    except Exception as e:
+        add_section(f"WARNING: COULD NOT CLEAN SHEET {sheet}", str(e))
+
+if len(all_panels) == 0:
+    raise ValueError("No sheets were cleaned. Please check workbook structure.")
+
+panel_all_categories = pd.concat(all_panels, ignore_index=True)
+
+# Keep all read categories in one object, but only selected categories in main analysis
+panel = panel_all_categories[
+    panel_all_categories["category"].isin(ALL_ANALYSIS_CATEGORIES)
+].copy()
+
+panel = panel.sort_values(["category", "country", "month"]).reset_index(drop=True)
+
+add_table("CLEAN PANEL PREVIEW", panel.head(25))
+
+
+# ============================================================
+# 8. CREATE VARIABLES
+# ============================================================
+
+panel["month_dt"] = panel["month"].dt.to_timestamp()
+panel["month_str"] = panel["month"].astype(str)
+panel["year"] = panel["month_dt"].dt.year
+
+panel["germany"] = (panel["country"] == TREATED_COUNTRY).astype(int)
+
+panel["pre_period"] = (panel["month"] < pd.Period(VAT_CUT_START, freq="M")).astype(int)
+
+panel["during_vat_cut"] = (
+    (panel["month"] >= pd.Period(VAT_CUT_START, freq="M")) &
+    (panel["month"] <= pd.Period(VAT_CUT_END, freq="M"))
+).astype(int)
+
+panel["post_reversal"] = (
+    panel["month"] >= pd.Period(POST_START, freq="M")
+).astype(int)
+
+panel["germany_during"] = panel["germany"] * panel["during_vat_cut"]
+panel["germany_post"] = panel["germany"] * panel["post_reversal"]
+
+panel["food_category"] = panel["category"].isin(CORE_FOOD_CATEGORIES).astype(int)
+panel["bread_dummy"] = (panel["category"] == "Bread").astype(int)
+
+panel["germany_during_bread"] = panel["germany_during"] * panel["bread_dummy"]
+panel["germany_post_bread"] = panel["germany_post"] * panel["bread_dummy"]
+
+panel["germany_during_food"] = panel["germany_during"] * panel["food_category"]
+panel["germany_post_food"] = panel["germany_post"] * panel["food_category"]
+
+panel["log_hicp"] = np.log(panel["hicp_index"])
+
+panel = panel.sort_values(["country", "category", "month"])
+panel["dlog_hicp"] = panel.groupby(["country", "category"])["log_hicp"].diff()
+
+panel_reg = panel.dropna(subset=["dlog_hicp"]).copy()
+
+add_section(
+    "DATA STRUCTURE AFTER CLEANING",
+    f"""
+Countries:
+{sorted(panel['country'].unique().tolist())}
+
+Categories used in main analysis:
+{sorted(panel['category'].unique().tolist())}
+
+Months:
+{panel['month'].min()} to {panel['month'].max()}
+
+Total clean panel observations:
+{len(panel)}
+
+Total regression observations after monthly differences:
+{len(panel_reg)}
+
+Note:
+Fruit and Vegetables were read from the workbook but excluded from the main baseline analysis because they are more seasonal.
+"""
+)
+
+
+# ============================================================
+# 9. DESCRIPTIVE STATISTICS
+# ============================================================
+
+category_summary = panel.groupby("category").agg(
+    mean_hicp=("hicp_index", "mean"),
+    sd_hicp=("hicp_index", "std"),
+    min_hicp=("hicp_index", "min"),
+    max_hicp=("hicp_index", "max"),
+    countries=("country", "nunique"),
+    months=("month", "nunique"),
+    observations=("hicp_index", "count")
+).reset_index()
+
+category_summary = safe_round_df(
+    category_summary,
+    ["mean_hicp", "sd_hicp", "min_hicp", "max_hicp"],
+    3
+)
+
+country_summary = panel.groupby("country").agg(
+    mean_hicp=("hicp_index", "mean"),
+    sd_hicp=("hicp_index", "std"),
+    min_hicp=("hicp_index", "min"),
+    max_hicp=("hicp_index", "max"),
+    categories=("category", "nunique"),
+    months=("month", "nunique"),
+    observations=("hicp_index", "count")
+).reset_index()
+
+country_summary = safe_round_df(
+    country_summary,
+    ["mean_hicp", "sd_hicp", "min_hicp", "max_hicp"],
+    3
+)
+
+period_summary = panel_reg.copy()
+period_summary["period"] = np.select(
+    [
+        period_summary["pre_period"] == 1,
+        period_summary["during_vat_cut"] == 1,
+        period_summary["post_reversal"] == 1
+    ],
+    [
+        "Pre-period",
+        "During VAT cut",
+        "Post-reversal"
+    ],
+    default="Other"
+)
+
+period_summary_table = period_summary.groupby(["category", "country", "period"]).agg(
+    mean_monthly_growth=("dlog_hicp", "mean"),
+    sd_monthly_growth=("dlog_hicp", "std"),
+    observations=("dlog_hicp", "count")
+).reset_index()
+
+period_summary_table = safe_round_df(
+    period_summary_table,
+    ["mean_monthly_growth", "sd_monthly_growth"],
+    6
+)
+
+add_table("CATEGORY SUMMARY", category_summary)
+add_table("COUNTRY SUMMARY", country_summary)
+add_table("PERIOD SUMMARY", period_summary_table)
+
+
+# ============================================================
+# 10. PRE-TREATMENT CORRELATION CHECKS
+# ============================================================
+
+def make_correlation_table(data, value_col, check_type):
+    rows = []
+
+    for category in ALL_ANALYSIS_CATEGORIES:
+        cat_df = data[data["category"] == category].copy()
+
+        wide = cat_df.pivot_table(
+            index="month",
+            columns="country",
+            values=value_col,
+            aggfunc="mean"
+        )
+
+        if "Germany" not in wide.columns:
+            continue
+
+        for country in CONTROL_COUNTRIES:
+            if country in wide.columns:
+                corr = wide["Germany"].corr(wide[country])
+                rows.append({
+                    "check_type": check_type,
+                    "category": category,
+                    "comparison": f"Germany vs {country}",
+                    "correlation": corr
+                })
+
+        control_cols = [c for c in CONTROL_COUNTRIES if c in wide.columns]
+
+        if len(control_cols) > 0:
+            wide["Average controls"] = wide[control_cols].mean(axis=1)
+            corr_avg = wide["Germany"].corr(wide["Average controls"])
+
+            rows.append({
+                "check_type": check_type,
+                "category": category,
+                "comparison": "Germany vs average controls",
+                "correlation": corr_avg
+            })
+
+    pooled = data[data["category"].isin(CORE_FOOD_CATEGORIES)].copy()
+    pooled = pooled.groupby(["country", "month"], as_index=False)[value_col].mean()
+
+    wide = pooled.pivot_table(
+        index="month",
+        columns="country",
+        values=value_col
+    )
+
+    if "Germany" in wide.columns:
+        for country in CONTROL_COUNTRIES:
+            if country in wide.columns:
+                corr = wide["Germany"].corr(wide[country])
+                rows.append({
+                    "check_type": check_type,
+                    "category": "Core food pooled",
+                    "comparison": f"Germany vs {country}",
+                    "correlation": corr
+                })
+
+        control_cols = [c for c in CONTROL_COUNTRIES if c in wide.columns]
+
+        if len(control_cols) > 0:
+            wide["Average controls"] = wide[control_cols].mean(axis=1)
+            corr_avg = wide["Germany"].corr(wide["Average controls"])
+
+            rows.append({
+                "check_type": check_type,
+                "category": "Core food pooled",
+                "comparison": "Germany vs average controls",
+                "correlation": corr_avg
+            })
+
+    result = pd.DataFrame(rows)
+    result = safe_round_df(result, ["correlation"], 3)
+
+    return result
+
+
+pre_levels = panel[
+    panel["month"] < pd.Period(VAT_CUT_START, freq="M")
+].copy()
+
+pre_changes = panel_reg[
+    panel_reg["month"] < pd.Period(VAT_CUT_START, freq="M")
+].copy()
+
+corr_levels = make_correlation_table(
+    pre_levels,
+    "log_hicp",
+    "Pre-treatment log HICP levels"
+)
+
+corr_changes = make_correlation_table(
+    pre_changes,
+    "dlog_hicp",
+    "Pre-treatment monthly log changes"
+)
+
+pre_treatment_correlations = pd.concat(
+    [corr_levels, corr_changes],
+    ignore_index=True
+)
+
+avg_control_corr = pre_treatment_correlations[
+    pre_treatment_correlations["comparison"] == "Germany vs average controls"
+].copy()
+
+add_table("PRE-TREATMENT CORRELATION CHECKS", pre_treatment_correlations)
+add_table("PRE-TREATMENT CORRELATION: GERMANY VS AVERAGE CONTROLS", avg_control_corr)
+
+
+# ============================================================
+# 11. BASELINE OLS FIXED-EFFECTS MODEL
+# ============================================================
+
+all_key_results = []
+all_full_results = []
+
+baseline_data = panel_reg[
+    panel_reg["category"].isin(CORE_FOOD_CATEGORIES)
+].copy()
+
+baseline_formula = """
+dlog_hicp ~ germany_during + germany_post + C(country) + C(category) + C(month_str)
+"""
+
+baseline_model = run_ols(
+    baseline_formula,
+    baseline_data,
+    "Baseline pooled food model"
+)
+
+if baseline_model is not None:
+    baseline_key = regression_key_table(
+        baseline_model,
+        "Baseline pooled food model"
+    )
+
+    baseline_full = full_regression_table(
+        baseline_model,
+        "Baseline pooled food model"
+    )
+
+    all_key_results.append(baseline_key)
+    all_full_results.append(baseline_full)
+
+    add_table("BASELINE OLS FIXED-EFFECTS RESULT", baseline_key)
+
+    add_section(
+        "BASELINE MODEL FIT",
+        f"""
+Observations: {int(baseline_model.nobs)}
+R-squared: {round(baseline_model.rsquared, 4)}
+Adjusted R-squared: {round(baseline_model.rsquared_adj, 4)}
+"""
+    )
+
+
+# ============================================================
+# 12. CATEGORY-SPECIFIC REGRESSIONS
+# ============================================================
+
+category_results_list = []
+
+for category in ALL_ANALYSIS_CATEGORIES:
+    cat_data = panel_reg[panel_reg["category"] == category].copy()
+
+    cat_formula = """
+    dlog_hicp ~ germany_during + germany_post + C(country) + C(month_str)
+    """
+
+    cat_model = run_ols(
+        cat_formula,
+        cat_data,
+        f"Category-specific: {category}"
+    )
+
+    if cat_model is not None:
+        cat_key = regression_key_table(
+            cat_model,
+            f"Category-specific: {category}"
+        )
+
+        cat_key["category"] = category
+        cat_key["observations"] = int(cat_model.nobs)
+        cat_key["r_squared"] = round(cat_model.rsquared, 4)
+
+        category_results_list.append(cat_key)
+        all_key_results.append(cat_key)
+
+        all_full_results.append(
+            full_regression_table(cat_model, f"Category-specific: {category}")
+        )
+
+if len(category_results_list) > 0:
+    category_results = pd.concat(category_results_list, ignore_index=True)
+else:
+    category_results = pd.DataFrame()
+
+add_table("CATEGORY-SPECIFIC REGRESSION RESULTS", category_results)
+
+
+# ============================================================
+# 13. BREAD AND CEREALS VS BREAD AGGREGATION TEST
+# ============================================================
+
+bread_data = panel_reg[
+    panel_reg["category"].isin(["Bread and cereals", "Bread"])
+].copy()
+
+bread_formula = """
+dlog_hicp ~ germany_during + germany_during_bread + germany_post + germany_post_bread
++ C(country) + C(category) + C(month_str)
+"""
+
+bread_model = run_ols(
+    bread_formula,
+    bread_data,
+    "Bread vs Bread and cereals aggregation test"
+)
+
+if bread_model is not None:
+    bread_key = regression_key_table(
+        bread_model,
+        "Bread vs Bread and cereals aggregation test"
+    )
+
+    all_key_results.append(bread_key)
+    all_full_results.append(
+        full_regression_table(bread_model, "Bread vs Bread and cereals aggregation test")
+    )
+
+    bread_summary = pd.DataFrame({
+        "effect": [
+            "Bread and cereals during effect",
+            "Additional Bread during effect",
+            "Total Bread during effect",
+            "Bread and cereals post effect",
+            "Additional Bread post effect",
+            "Total Bread post effect"
+        ],
+        "value": [
+            bread_model.params.get("germany_during", np.nan),
+            bread_model.params.get("germany_during_bread", np.nan),
+            bread_model.params.get("germany_during", 0) + bread_model.params.get("germany_during_bread", 0),
+            bread_model.params.get("germany_post", np.nan),
+            bread_model.params.get("germany_post_bread", np.nan),
+            bread_model.params.get("germany_post", 0) + bread_model.params.get("germany_post_bread", 0)
+        ]
+    })
+
+    bread_summary = safe_round_df(bread_summary, ["value"], 6)
+
+    add_table("BREAD VS BREAD AND CEREALS REGRESSION", bread_key)
+    add_table("BREAD AGGREGATION TOTAL EFFECTS", bread_summary)
+
+
+# ============================================================
+# 14. FOOD VS CLOTHING COMPARISON
+# ============================================================
+
+food_clothing_data = panel_reg[
+    panel_reg["category"].isin(ALL_ANALYSIS_CATEGORIES)
+].copy()
+
+food_clothing_formula = """
+dlog_hicp ~ germany_during + germany_during_food + germany_post + germany_post_food
++ C(country) + C(category) + C(month_str)
+"""
+
+food_clothing_model = run_ols(
+    food_clothing_formula,
+    food_clothing_data,
+    "Food vs Clothing comparison"
+)
+
+if food_clothing_model is not None:
+    food_clothing_key = regression_key_table(
+        food_clothing_model,
+        "Food vs Clothing comparison"
+    )
+
+    all_key_results.append(food_clothing_key)
+    all_full_results.append(
+        full_regression_table(food_clothing_model, "Food vs Clothing comparison")
+    )
+
+    food_clothing_summary = pd.DataFrame({
+        "effect": [
+            "Clothing during effect",
+            "Additional food during effect",
+            "Total food during effect",
+            "Clothing post effect",
+            "Additional food post effect",
+            "Total food post effect"
+        ],
+        "value": [
+            food_clothing_model.params.get("germany_during", np.nan),
+            food_clothing_model.params.get("germany_during_food", np.nan),
+            food_clothing_model.params.get("germany_during", 0) + food_clothing_model.params.get("germany_during_food", 0),
+            food_clothing_model.params.get("germany_post", np.nan),
+            food_clothing_model.params.get("germany_post_food", np.nan),
+            food_clothing_model.params.get("germany_post", 0) + food_clothing_model.params.get("germany_post_food", 0)
+        ]
+    })
+
+    food_clothing_summary = safe_round_df(food_clothing_summary, ["value"], 6)
+
+    add_table("FOOD VS CLOTHING REGRESSION", food_clothing_key)
+    add_table("FOOD VS CLOTHING TOTAL EFFECTS", food_clothing_summary)
+
+
+# ============================================================
+# 15. ROBUSTNESS CHECKS
+# ============================================================
+
+def run_baseline_for_countries(country_list, specification):
+    temp_data = baseline_data[
+        baseline_data["country"].isin(country_list)
+    ].copy()
+
+    if temp_data.empty:
+        return {
+            "specification": specification,
+            "countries": ", ".join(country_list),
+            "during_coef": np.nan,
+            "during_p_value": np.nan,
+            "post_coef": np.nan,
+            "post_p_value": np.nan,
+            "observations": 0,
+            "r_squared": np.nan
+        }
+
+    model = run_ols(
+        baseline_formula,
+        temp_data,
+        specification
+    )
+
+    if model is None:
+        return {
+            "specification": specification,
+            "countries": ", ".join(country_list),
+            "during_coef": np.nan,
+            "during_p_value": np.nan,
+            "post_coef": np.nan,
+            "post_p_value": np.nan,
+            "observations": len(temp_data),
+            "r_squared": np.nan
+        }
+
+    return {
+        "specification": specification,
+        "countries": ", ".join(country_list),
+        "during_coef": model.params.get("germany_during", np.nan),
+        "during_p_value": model.pvalues.get("germany_during", np.nan),
+        "post_coef": model.params.get("germany_post", np.nan),
+        "post_p_value": model.pvalues.get("germany_post", np.nan),
+        "observations": int(model.nobs),
+        "r_squared": model.rsquared
+    }
+
+
+robustness_rows = []
+
+robustness_rows.append(
+    run_baseline_for_countries(
+        ["Germany"] + CONTROL_COUNTRIES,
+        "Germany vs all controls"
+    )
+)
+
+robustness_rows.append(
+    run_baseline_for_countries(
+        ["Germany", "Austria"],
+        "Germany vs Austria only"
+    )
+)
+
+for drop_country in CONTROL_COUNTRIES:
+    remaining_controls = [c for c in CONTROL_COUNTRIES if c != drop_country]
+
+    robustness_rows.append(
+        run_baseline_for_countries(
+            ["Germany"] + remaining_controls,
+            f"Leave-one-out: drop {drop_country}"
+        )
+    )
+
+robustness_results = pd.DataFrame(robustness_rows)
+
+robustness_results = safe_round_df(
+    robustness_results,
+    ["during_coef", "during_p_value", "post_coef", "post_p_value", "r_squared"],
+    6
+)
+
+add_table("ROBUSTNESS CHECKS", robustness_results)
+
+
+# ============================================================
+# 16. PAIRWISE COUNTRY ROBUSTNESS
+# ============================================================
+
+pairwise_rows = []
+
+for control in CONTROL_COUNTRIES:
+    row = run_baseline_for_countries(
+        ["Germany", control],
+        f"Germany vs {control}"
+    )
+    pairwise_rows.append(row)
+
+pairwise_results = pd.DataFrame(pairwise_rows)
+
+pairwise_results["during_sign"] = np.where(
+    pairwise_results["during_coef"] < 0,
+    "Negative",
+    "Positive"
+)
+
+pairwise_results["post_sign"] = np.where(
+    pairwise_results["post_coef"] > 0,
+    "Positive",
+    "Negative"
+)
+
+pairwise_results["interpretation"] = pairwise_results.apply(
+    lambda r: "Expected sign pattern"
+    if r["during_coef"] < 0 and r["post_coef"] > 0
+    else "Different sign pattern",
+    axis=1
+)
+
+pairwise_results = safe_round_df(
+    pairwise_results,
+    ["during_coef", "during_p_value", "post_coef", "post_p_value", "r_squared"],
+    6
+)
+
+add_table("PAIRWISE COUNTRY ROBUSTNESS", pairwise_results)
+
+
+# ============================================================
+# 17. EVENT-STUDY STYLE CHECK
+# ============================================================
+
+event_results = pd.DataFrame()
+
+event_data = baseline_data.copy()
+
+if not event_data.empty:
+    event_data["relative_month"] = (
+        event_data["month"].apply(lambda x: x.ordinal) -
+        pd.Period(VAT_CUT_START, freq="M").ordinal
+    )
+
+    event_data = event_data[
+        (event_data["relative_month"] >= -12) &
+        (event_data["relative_month"] <= 18)
+    ].copy()
+
+    event_months = sorted(event_data["relative_month"].unique())
+    reference_month = -1
+
+    event_vars = []
+
+    for k in event_months:
+        if k == reference_month:
+            continue
+
+        if k < 0:
+            var_name = f"event_m{abs(k)}"
+        else:
+            var_name = f"event_p{k}"
+
+        event_data[var_name] = (
+            (event_data["relative_month"] == k).astype(int) *
+            event_data["germany"]
+        )
+
+        event_vars.append(var_name)
+
+    if len(event_vars) > 0:
+        event_formula = (
+            "dlog_hicp ~ "
+            + " + ".join(event_vars)
+            + " + C(country) + C(category) + C(month_str)"
+        )
+
+        event_model = run_ols(
+            event_formula,
+            event_data,
+            "Event-study style model"
+        )
+
+        if event_model is not None:
+            event_rows = []
+
+            for k in event_months:
+                if k == reference_month:
+                    continue
+
+                if k < 0:
+                    var_name = f"event_m{abs(k)}"
+                else:
+                    var_name = f"event_p{k}"
+
+                if var_name in event_model.params.index:
+                    p = event_model.pvalues.get(var_name, np.nan)
+
+                    event_rows.append({
+                        "relative_month": k,
+                        "calendar_month": str(pd.Period(VAT_CUT_START, freq="M") + k),
+                        "coef": event_model.params.get(var_name, np.nan),
+                        "std_error": event_model.bse.get(var_name, np.nan),
+                        "p_value": p,
+                        "significance": significance_stars(p)
+                    })
+
+            event_results = pd.DataFrame(event_rows)
+            event_results = safe_round_df(
+                event_results,
+                ["coef", "std_error", "p_value"],
+                6
+            )
+
+add_table("EVENT-STUDY STYLE RESULTS", event_results)
+
+
+# ============================================================
+# 18. FINAL COMBINED KEY RESULTS
+# ============================================================
+
+if len(all_key_results) > 0:
+    final_key_results = pd.concat(all_key_results, ignore_index=True)
+else:
+    final_key_results = pd.DataFrame()
+
+if len(all_full_results) > 0:
+    final_full_results = pd.concat(all_full_results, ignore_index=True)
+else:
+    final_full_results = pd.DataFrame()
+
+add_table("FINAL KEY REGRESSION RESULTS", final_key_results)
+
+add_table("FULL REGRESSION RESULTS PREVIEW", final_full_results, max_rows=100)
+
+
+# ============================================================
+# 19. STUDENT-STYLE RESULT INTERPRETATION NOTES
+# ============================================================
+
+notes = """
+MAIN STUDENT-STYLE INTERPRETATION NOTES
+
+1. Baseline model:
+The baseline model is the main result. It uses selected food categories:
+Bread and cereals, Bread, Meat, and Milk, cheese and eggs.
+If germany_during is negative, it means German food price growth was lower during the VAT-cut period compared with the control countries.
+If germany_post is positive, it means German food price growth was higher after the VAT cut ended.
+
+2. Heterogeneity:
+The category-specific regressions show whether all product categories reacted in the same way.
+If the coefficients differ across Bread, Meat, and Milk, cheese and eggs, then this supports the heterogeneity part of the paper.
+
+3. Bread vs Bread and cereals:
+Bread and cereals is a broader category.
+Bread is a narrower category.
+This test checks whether aggregation matters.
+If the results differ, the paper can say that broader categories may hide more specific price movements.
+
+4. Food vs Clothing:
+Clothing is used only as a non-food comparison.
+It should be interpreted carefully because clothing prices can be affected by seasonal sales and discounts.
+
+5. Asymmetry:
+The asymmetry idea comes from comparing the during-VAT-cut coefficient with the post-reversal coefficient.
+A negative during coefficient and a positive post coefficient show a reversal pattern.
+But we should not overclaim strong asymmetry unless the size difference is clearly large and statistically strong.
+
+6. Robustness:
+Robustness checks show whether the result depends on one control country.
+If signs stay similar, the result is stronger.
+
+7. Pairwise checks:
+Pairwise checks compare Germany separately with Austria, France, Netherlands, and Belgium.
+The exact numbers may differ, but the important thing is whether the sign pattern stays stable.
+
+8. Pre-treatment correlation:
+This is only a descriptive check.
+It supports whether Germany and the control countries moved similarly before the VAT cut.
+It does not prove causality.
+
+9. 2SLS:
+2SLS is not used because there is no strong valid instrument for Germany's VAT cut.
+OLS with fixed effects is more suitable for this seminar paper.
+
+10. Important wording for the paper:
+Use careful language:
+"The results are consistent with VAT pass-through."
+Do not write:
+"The results prove that the VAT cut caused all price changes."
+"""
+
+add_section("STUDENT-STYLE INTERPRETATION NOTES", notes)
+
+
+# ============================================================
+# 20. SAVE ONE NOTEPAD FILE
+# ============================================================
+
+with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
+    f.write("\n".join(all_text_output))
+
+
+# ============================================================
+# 21. FINAL TERMINAL MESSAGE
+# ============================================================
+
+print("\n" + "#" * 95)
+print("DONE")
+print("#" * 95)
+print("All results were printed above in terminal.")
+print("One Notepad result file was saved here:")
+print(OUTPUT_TXT)
+print("#" * 95)

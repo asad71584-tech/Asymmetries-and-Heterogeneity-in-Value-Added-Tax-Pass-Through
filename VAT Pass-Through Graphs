@@ -1,33 +1,11 @@
-# ============================================================
-# VAT Pass-Through Graphs
-# Creates:
-# Figure 1: Core food HICP trend Germany vs control average
-# Figure 2: Baseline coefficients
-# Appendix Figure A1: Core food HICP trend Germany vs Austria
-# Appendix Figure A2: Category-specific coefficients
-# ============================================================
-
 import re
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# ============================================================
-# 1. FILE PATHS
-# ============================================================
-
 INPUT_FILE = r"D:\MSEP\4th\Pub. Eco. Reseach M\Data\3rd\meat, bread, milk cloths...xlsx"
-
-OUTPUT_DIR = Path(r"D:\MSEP\4th\Pub. Eco. Reseach M\Graphs")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# 2. SETTINGS
-# ============================================================
 
 TREATED_COUNTRY = "Germany"
 CONTROL_COUNTRIES = ["Austria", "France", "Belgium", "Netherlands"]
@@ -51,21 +29,12 @@ VAT_CUT_START = pd.Timestamp("2020-07-01")
 VAT_REVERSAL = pd.Timestamp("2021-01-01")
 
 
-# ============================================================
-# 3. DATE / MONTH HELPERS
-# ============================================================
-
 def parse_month_value(value):
-    """
-    Try to convert a cell value into a monthly Timestamp.
-    Returns None if the value is not a month.
-    """
-
     if pd.isna(value):
         return None
 
     if isinstance(value, pd.Timestamp):
-        return pd.Timestamp(value).replace(day=1)
+        return value.replace(day=1)
 
     if hasattr(value, "year") and hasattr(value, "month"):
         try:
@@ -78,33 +47,22 @@ def parse_month_value(value):
     if text == "":
         return None
 
-    # Common Eurostat style examples:
-    # 2018-01, 2018M01, 2018-01-01, 2018/01
-    patterns = [
-        r"^\d{4}-\d{2}$",
-        r"^\d{4}M\d{2}$",
-        r"^\d{4}-\d{2}-\d{2}$",
-        r"^\d{4}/\d{2}$",
-        r"^\d{2}/\d{4}$",
-    ]
-
     if re.match(r"^\d{4}M\d{2}$", text):
-        year = int(text[:4])
-        month = int(text[-2:])
-        return pd.Timestamp(year=year, month=month, day=1)
+        return pd.Timestamp(year=int(text[:4]), month=int(text[-2:]), day=1)
 
-    for pattern in patterns:
-        if re.match(pattern, text):
-            parsed = pd.to_datetime(text.replace("M", "-"), errors="coerce")
-            if not pd.isna(parsed):
-                return pd.Timestamp(parsed).replace(day=1)
+    if re.match(r"^\d{4}-\d{2}$", text):
+        return pd.to_datetime(text + "-01", errors="coerce")
 
-    # Try general parsing
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        return pd.to_datetime(text, errors="coerce").replace(day=1)
+
     parsed = pd.to_datetime(text, errors="coerce")
-    if not pd.isna(parsed):
-        # Avoid treating random years like 2018 as monthly columns
-        if parsed.year >= 2010 and parsed.year <= 2030:
-            return pd.Timestamp(parsed).replace(day=1)
+
+    if pd.isna(parsed):
+        return None
+
+    if 2010 <= parsed.year <= 2030:
+        return parsed.replace(day=1)
 
     return None
 
@@ -113,19 +71,11 @@ def is_month_cell(value):
     return parse_month_value(value) is not None
 
 
-# ============================================================
-# 4. COUNTRY HELPERS
-# ============================================================
-
 def clean_country_name(value):
-    """Clean country names."""
     if pd.isna(value):
         return None
 
     text = str(value).strip()
-
-    # Remove common Eurostat prefixes if present
-    text = text.replace("Germany (until 1990 former territory of the FRG)", "Germany")
 
     country_map = {
         "germany": "Germany",
@@ -148,336 +98,198 @@ def clean_country_name(value):
 
 
 def looks_like_country(value):
-    cleaned = clean_country_name(value)
-    return cleaned in [TREATED_COUNTRY] + CONTROL_COUNTRIES
+    return clean_country_name(value) in [TREATED_COUNTRY] + CONTROL_COUNTRIES
 
 
-# ============================================================
-# 5. ROBUST SHEET CLEANING
-# ============================================================
-
-def find_header_row(raw_df, sheet_name):
-    """
-    Find the row that contains monthly columns.
-    This is needed because your Excel sheets have metadata rows before the real table.
-    """
-
-    best_row_index = None
-    best_month_count = 0
+def find_header_row(raw_df):
+    best_row = None
+    best_count = 0
 
     for idx in range(len(raw_df)):
-        row_values = raw_df.iloc[idx].tolist()
-        month_count = sum(is_month_cell(v) for v in row_values)
+        count = sum(is_month_cell(v) for v in raw_df.iloc[idx].tolist())
 
-        if month_count > best_month_count:
-            best_month_count = month_count
-            best_row_index = idx
+        if count > best_count:
+            best_count = count
+            best_row = idx
 
-    if best_row_index is None or best_month_count < 6:
-        raise ValueError(
-            f"No header row with monthly columns found in sheet '{sheet_name}'. "
-            f"Best month count was {best_month_count}."
-        )
+    if best_row is None or best_count < 6:
+        raise ValueError("No monthly header row found.")
 
-    return best_row_index
+    return best_row
 
 
-def find_country_column(data_df):
-    """
-    Find the column containing country names/codes.
-    """
-
+def find_country_column(df):
     best_col = None
     best_score = 0
 
-    for col in data_df.columns:
-        values = data_df[col].dropna().head(30).tolist()
+    for col in df.columns:
+        values = df[col].dropna().head(40).tolist()
         score = sum(looks_like_country(v) for v in values)
 
         if score > best_score:
             best_score = score
             best_col = col
 
-    if best_col is None or best_score == 0:
-        raise ValueError("Could not find country column.")
+    if best_col is None:
+        raise ValueError("No country column found.")
 
     return best_col
 
 
-def clean_sheet(sheet_name, input_file):
-    """
-    Robustly clean one sheet:
-    - Reads without headers
-    - Finds the row with month columns
-    - Uses that row as header
-    - Finds country column
-    - Converts wide monthly data to long panel
-    """
-
-    raw = pd.read_excel(input_file, sheet_name=sheet_name, header=None)
+def clean_sheet(sheet_name):
+    raw = pd.read_excel(INPUT_FILE, sheet_name=sheet_name, header=None)
     raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
 
-    if raw.empty:
-        raise ValueError(f"Sheet '{sheet_name}' is empty.")
-
-    header_row = find_header_row(raw, sheet_name)
+    header_row = find_header_row(raw)
 
     headers = raw.iloc[header_row].tolist()
     data = raw.iloc[header_row + 1:].copy()
-    data.columns = headers
-
+    data.columns = [str(h).strip() for h in headers]
     data = data.dropna(how="all").dropna(axis=1, how="all")
-
-    # Make column names unique
-    new_columns = []
-    seen = {}
-    for col in data.columns:
-        col_text = str(col).strip()
-        if col_text in seen:
-            seen[col_text] += 1
-            col_text = f"{col_text}_{seen[col_text]}"
-        else:
-            seen[col_text] = 0
-        new_columns.append(col_text)
-
-    data.columns = new_columns
 
     month_cols = []
     month_map = {}
 
     for col in data.columns:
-        parsed_month = parse_month_value(col)
-        if parsed_month is not None:
-            month_cols.append(col)
-            month_map[col] = parsed_month
+        month = parse_month_value(col)
 
-    if not month_cols:
-        raise ValueError(f"No monthly columns found after header detection in '{sheet_name}'.")
+        if month is not None:
+            month_cols.append(col)
+            month_map[col] = month
 
     country_col = find_country_column(data)
 
-    keep_cols = [country_col] + month_cols
-    temp = data[keep_cols].copy()
-
+    temp = data[[country_col] + month_cols].copy()
     temp = temp.rename(columns={country_col: "country"})
     temp["country"] = temp["country"].apply(clean_country_name)
-
     temp = temp[temp["country"].isin([TREATED_COUNTRY] + CONTROL_COUNTRIES)]
 
     long_df = temp.melt(
-        id_vars=["country"],
+        id_vars="country",
         value_vars=month_cols,
-        var_name="month_original",
+        var_name="month_raw",
         value_name="hicp_index",
     )
 
-    long_df["month"] = long_df["month_original"].map(month_map)
+    long_df["month"] = long_df["month_raw"].map(month_map)
     long_df["hicp_index"] = pd.to_numeric(long_df["hicp_index"], errors="coerce")
     long_df["category"] = sheet_name
-
     long_df = long_df.dropna(subset=["country", "month", "hicp_index"])
 
     return long_df[["country", "month", "category", "hicp_index"]]
 
 
-def load_hicp_panel(input_file):
-    """Load all selected category sheets into one panel."""
-
-    xls = pd.ExcelFile(input_file)
-    available_sheets = xls.sheet_names
-
-    print("\nAvailable sheets:")
-    for sheet in available_sheets:
-        print(f" - {sheet}")
-
-    panel_parts = []
+def load_panel():
+    parts = []
 
     for sheet in ALL_SELECTED_CATEGORIES:
-        if sheet not in available_sheets:
-            print(f"WARNING: Sheet not found: {sheet}")
-            continue
-
         try:
-            cleaned = clean_sheet(sheet, input_file)
-            panel_parts.append(cleaned)
-            print(f"Cleaned sheet: {sheet} | rows: {len(cleaned)}")
-
+            df = clean_sheet(sheet)
+            parts.append(df)
+            print(f"{sheet}: {len(df)} rows")
         except Exception as e:
-            print(f"WARNING: Could not clean sheet {sheet}: {e}")
+            print(f"{sheet}: skipped ({e})")
 
-    if not panel_parts:
-        raise RuntimeError("No sheets could be cleaned. Please check Excel structure.")
+    if not parts:
+        raise RuntimeError("No sheets could be loaded.")
 
-    panel = pd.concat(panel_parts, ignore_index=True)
+    panel = pd.concat(parts, ignore_index=True)
     panel = panel.sort_values(["country", "category", "month"]).reset_index(drop=True)
 
     return panel
 
 
-# ============================================================
-# 6. DATA PREPARATION FOR GRAPHS
-# ============================================================
-
-def prepare_core_food_trend(panel):
-    """Average selected food categories by country and month."""
-
+def prepare_core_food(panel):
     core = panel[panel["category"].isin(CORE_FOOD_CATEGORIES)].copy()
 
-    country_month = (
+    return (
         core.groupby(["country", "month"], as_index=False)["hicp_index"]
         .mean()
-        .rename(columns={"hicp_index": "core_food_hicp"})
+        .rename(columns={"hicp_index": "hicp_index"})
     )
 
-    return country_month
 
-
-# ============================================================
-# 7. GRAPH STYLE HELPERS
-# ============================================================
-
-def add_policy_lines(ax):
-    """Add VAT cut and reversal lines."""
-
-    ax.axvline(
-        VAT_CUT_START,
-        linestyle="--",
-        linewidth=1.5,
-        color="black",
-        alpha=0.75,
-    )
-
-    ax.axvline(
-        VAT_REVERSAL,
-        linestyle="--",
-        linewidth=1.5,
-        color="black",
-        alpha=0.75,
-    )
+def mark_policy_dates(ax):
+    ax.axvline(VAT_CUT_START, linestyle="--", color="black", linewidth=1.2, alpha=0.7)
+    ax.axvline(VAT_REVERSAL, linestyle="--", color="black", linewidth=1.2, alpha=0.7)
 
     ymin, ymax = ax.get_ylim()
+    y_pos = ymax - (ymax - ymin) * 0.06
 
     ax.text(
         VAT_CUT_START,
-        ymax,
-        "VAT cut begins\nJul 2020",
+        y_pos,
+        "VAT cut\nJul 2020",
         rotation=90,
-        va="top",
         ha="right",
-        fontsize=9,
+        va="top",
+        fontsize=8,
     )
 
     ax.text(
         VAT_REVERSAL,
-        ymax,
-        "VAT reversal\nJan 2021",
+        y_pos,
+        "Reversal\nJan 2021",
         rotation=90,
-        va="top",
         ha="right",
-        fontsize=9,
+        va="top",
+        fontsize=8,
     )
 
 
-def apply_clean_style(ax, title, subtitle=None, y_label="HICP index", x_label="Month"):
-    """Clean academic graph style."""
-
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=14)
-
-    if subtitle:
-        ax.text(
-            0,
-            1.03,
-            subtitle,
-            transform=ax.transAxes,
-            fontsize=10,
-            va="bottom",
-            ha="left",
-        )
-
-    ax.set_xlabel(x_label, fontsize=11)
-    ax.set_ylabel(y_label, fontsize=11)
-
-    ax.grid(True, axis="y", alpha=0.3)
+def format_line_chart(ax, title):
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    ax.set_xlabel("Month", fontsize=10)
+    ax.set_ylabel("HICP index", fontsize=10)
+    ax.grid(axis="y", alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(axis="x", labelrotation=45)
-    ax.legend(frameon=False, fontsize=10)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=8)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
 
 
-def save_figure(fig, filename):
-    """Save figure as PNG and PDF."""
-
-    png_path = OUTPUT_DIR / f"{filename}.png"
-    pdf_path = OUTPUT_DIR / f"{filename}.pdf"
-
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
-
-    print(f"Saved: {png_path}")
-    print(f"Saved: {pdf_path}")
-
-
-# ============================================================
-# 8. FIGURE 1
-# ============================================================
-
-def create_figure_1(country_month):
-    """Core food HICP trend: Germany vs average controls."""
-
-    germany = country_month[country_month["country"] == TREATED_COUNTRY].copy()
+def graph_germany_vs_controls(country_month):
+    germany = country_month[country_month["country"] == "Germany"].copy()
 
     controls = (
         country_month[country_month["country"].isin(CONTROL_COUNTRIES)]
-        .groupby("month", as_index=False)["core_food_hicp"]
+        .groupby("month", as_index=False)["hicp_index"]
         .mean()
-        .rename(columns={"core_food_hicp": "control_average"})
+        .rename(columns={"hicp_index": "control_average"})
     )
 
     plot_df = germany.merge(controls, on="month", how="inner")
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+    fig, ax = plt.subplots(figsize=(9, 4.8))
 
     ax.plot(
         plot_df["month"],
-        plot_df["core_food_hicp"],
-        linewidth=2.5,
+        plot_df["hicp_index"],
         marker="o",
-        markersize=3,
+        markersize=2.5,
+        linewidth=2,
         label="Germany",
     )
 
     ax.plot(
         plot_df["month"],
         plot_df["control_average"],
-        linewidth=2.5,
         marker="o",
-        markersize=3,
+        markersize=2.5,
+        linewidth=2,
         label="Average controls",
     )
 
-    add_policy_lines(ax)
-
-    apply_clean_style(
-        ax=ax,
-        title="Figure 1: Core Food HICP Trend in Germany and Control Countries",
-        subtitle="Germany compared with the average of Austria, France, Belgium and the Netherlands",
-        y_label="Core food HICP index",
-        x_label="Month",
-    )
+    mark_policy_dates(ax)
+    format_line_chart(ax, "Descriptive HICP Trends: Germany vs Control Average")
 
     fig.tight_layout()
-    save_figure(fig, "Figure_1_Core_Food_Germany_vs_Control_Average")
-    plt.close(fig)
+    plt.show()
 
 
-# ============================================================
-# 9. FIGURE 2
-# ============================================================
-
-def create_figure_2():
-    """Baseline coefficients with 95% confidence intervals."""
-
-    coef_df = pd.DataFrame(
+def graph_baseline_coefficients():
+    df = pd.DataFrame(
         {
             "variable": ["Germany × During", "Germany × Post"],
             "coefficient": [-0.003062, 0.003151],
@@ -486,138 +298,76 @@ def create_figure_2():
         }
     )
 
-    coef_df["ci_low"] = coef_df["coefficient"] - 1.96 * coef_df["std_error"]
-    coef_df["ci_high"] = coef_df["coefficient"] + 1.96 * coef_df["std_error"]
+    df["ci_low"] = df["coefficient"] - 1.96 * df["std_error"]
+    df["ci_high"] = df["coefficient"] + 1.96 * df["std_error"]
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
 
-    x_pos = np.arange(len(coef_df))
+    x = np.arange(len(df))
 
-    ax.bar(
-        x_pos,
-        coef_df["coefficient"],
-        width=0.55,
-        edgecolor="black",
-        linewidth=0.8,
-    )
-
-    yerr = [
-        coef_df["coefficient"] - coef_df["ci_low"],
-        coef_df["ci_high"] - coef_df["coefficient"],
-    ]
+    ax.bar(x, df["coefficient"], width=0.5, edgecolor="black", linewidth=0.8)
 
     ax.errorbar(
-        x_pos,
-        coef_df["coefficient"],
-        yerr=yerr,
+        x,
+        df["coefficient"],
+        yerr=[
+            df["coefficient"] - df["ci_low"],
+            df["ci_high"] - df["coefficient"],
+        ],
         fmt="none",
         ecolor="black",
-        elinewidth=1.4,
-        capsize=6,
-        label="95% confidence interval",
+        elinewidth=1.2,
+        capsize=5,
     )
 
-    ax.axhline(0, color="black", linewidth=1.0)
+    ax.axhline(0, color="black", linewidth=1)
 
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(coef_df["variable"], fontsize=11)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["variable"], fontsize=10)
+    ax.set_ylabel("Coefficient", fontsize=10)
+    ax.set_title("Baseline Regression Coefficients", fontsize=13, fontweight="bold", pad=12)
 
-    for i, row in coef_df.iterrows():
+    for i, row in df.iterrows():
         label = f"{row['coefficient']:.4f}\np={row['p_value']:.3f}"
-        y_value = row["coefficient"]
+        offset = 0.00025 if row["coefficient"] > 0 else -0.00025
+        va = "bottom" if row["coefficient"] > 0 else "top"
 
-        if y_value >= 0:
-            va = "bottom"
-            offset = 0.00025
-        else:
-            va = "top"
-            offset = -0.00025
+        ax.text(i, row["coefficient"] + offset, label, ha="center", va=va, fontsize=9)
 
-        ax.text(
-            i,
-            y_value + offset,
-            label,
-            ha="center",
-            va=va,
-            fontsize=10,
-        )
-
-    ax.set_title(
-        "Figure 2: Baseline During-Cut and Post-Reversal Coefficients",
-        fontsize=14,
-        fontweight="bold",
-        pad=14,
-    )
-
-    ax.text(
-        0,
-        1.03,
-        "Pooled food fixed-effects model; dependent variable is monthly ΔlnHICP",
-        transform=ax.transAxes,
-        fontsize=10,
-        va="bottom",
-        ha="left",
-    )
-
-    ax.set_ylabel("Coefficient", fontsize=11)
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, fontsize=10, loc="lower right")
 
     fig.tight_layout()
-    save_figure(fig, "Figure_2_Baseline_Coefficients")
-    plt.close(fig)
+    plt.show()
 
 
-# ============================================================
-# 10. APPENDIX FIGURE A1
-# ============================================================
+def graph_germany_vs_austria(country_month):
+    plot_df = country_month[country_month["country"].isin(["Germany", "Austria"])].copy()
 
-def create_appendix_figure_a1(country_month):
-    """Core food HICP trend: Germany vs Austria."""
-
-    plot_df = country_month[
-        country_month["country"].isin(["Germany", "Austria"])
-    ].copy()
-
-    fig, ax = plt.subplots(figsize=(10.5, 5.8))
+    fig, ax = plt.subplots(figsize=(9, 4.8))
 
     for country in ["Germany", "Austria"]:
-        temp = plot_df[plot_df["country"] == country].copy()
+        temp = plot_df[plot_df["country"] == country]
 
         ax.plot(
             temp["month"],
-            temp["core_food_hicp"],
-            linewidth=2.5,
+            temp["hicp_index"],
             marker="o",
-            markersize=3,
+            markersize=2.5,
+            linewidth=2,
             label=country,
         )
 
-    add_policy_lines(ax)
-
-    apply_clean_style(
-        ax=ax,
-        title="Appendix Figure A1: Core Food HICP Trend in Germany and Austria",
-        subtitle="Austria is shown separately as an important comparison country",
-        y_label="Core food HICP index",
-        x_label="Month",
-    )
+    mark_policy_dates(ax)
+    format_line_chart(ax, "Robustness Check: Germany vs Austria")
 
     fig.tight_layout()
-    save_figure(fig, "Appendix_Figure_A1_Core_Food_Germany_vs_Austria")
-    plt.close(fig)
+    plt.show()
 
 
-# ============================================================
-# 11. APPENDIX FIGURE A2
-# ============================================================
-
-def create_appendix_figure_a2():
-    """Category-specific during-cut and post-reversal coefficients."""
-
-    category_df = pd.DataFrame(
+def graph_category_coefficients():
+    df = pd.DataFrame(
         {
             "category": [
                 "Bread and cereals",
@@ -631,119 +381,53 @@ def create_appendix_figure_a2():
         }
     )
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+    fig, ax = plt.subplots(figsize=(9, 5))
 
-    y_pos = np.arange(len(category_df))
-    bar_height = 0.36
+    y = np.arange(len(df))
+    h = 0.35
 
     ax.barh(
-        y_pos - bar_height / 2,
-        category_df["during"],
-        height=bar_height,
+        y - h / 2,
+        df["during"],
+        height=h,
+        edgecolor="black",
+        linewidth=0.7,
         label="During VAT cut",
-        edgecolor="black",
-        linewidth=0.7,
     )
 
     ax.barh(
-        y_pos + bar_height / 2,
-        category_df["post"],
-        height=bar_height,
-        label="Post-reversal",
+        y + h / 2,
+        df["post"],
+        height=h,
         edgecolor="black",
         linewidth=0.7,
+        label="Post-reversal",
     )
 
-    ax.axvline(0, color="black", linewidth=1.0)
+    ax.axvline(0, color="black", linewidth=1)
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(category_df["category"], fontsize=10)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df["category"], fontsize=9)
+    ax.set_xlabel("Coefficient", fontsize=10)
+    ax.set_title("Category-Specific Coefficient Estimates", fontsize=13, fontweight="bold", pad=12)
 
-    ax.set_title(
-        "Appendix Figure A2: Category-Specific During-Cut and Post-Reversal Coefficients",
-        fontsize=14,
-        fontweight="bold",
-        pad=14,
-    )
-
-    ax.text(
-        0,
-        1.03,
-        "Separate category regressions; dependent variable is monthly ΔlnHICP",
-        transform=ax.transAxes,
-        fontsize=10,
-        va="bottom",
-        ha="left",
-    )
-
-    ax.set_xlabel("Coefficient", fontsize=11)
-    ax.grid(True, axis="x", alpha=0.3)
+    ax.grid(axis="x", alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, fontsize=10, loc="lower right")
-
-    for i, row in category_df.iterrows():
-        ax.text(
-            row["during"],
-            i - bar_height / 2,
-            f"{row['during']:.4f}",
-            va="center",
-            ha="right" if row["during"] < 0 else "left",
-            fontsize=9,
-        )
-
-        ax.text(
-            row["post"],
-            i + bar_height / 2,
-            f"{row['post']:.4f}",
-            va="center",
-            ha="left" if row["post"] > 0 else "right",
-            fontsize=9,
-        )
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
 
     fig.tight_layout()
-    save_figure(fig, "Appendix_Figure_A2_Category_Specific_Coefficients")
-    plt.close(fig)
+    plt.show()
 
-
-# ============================================================
-# 12. MAIN
-# ============================================================
 
 def main():
-    print("\n" + "=" * 70)
-    print("STARTING VAT PASS-THROUGH GRAPH CREATION")
-    print("=" * 70)
+    panel = load_panel()
+    country_month = prepare_core_food(panel)
 
-    print(f"\nInput file:\n{INPUT_FILE}")
-    print(f"\nOutput folder:\n{OUTPUT_DIR}")
-
-    panel = load_hicp_panel(INPUT_FILE)
-
-    print("\nPanel overview:")
-    print(panel.head())
-    print(f"\nTotal rows: {len(panel)}")
-    print(f"Countries: {sorted(panel['country'].unique())}")
-    print(f"Categories: {sorted(panel['category'].unique())}")
-    print(f"Date range: {panel['month'].min().date()} to {panel['month'].max().date()}")
-
-    country_month = prepare_core_food_trend(panel)
-
-    create_figure_1(country_month)
-    create_figure_2()
-    create_appendix_figure_a1(country_month)
-    create_appendix_figure_a2()
-
-    print("\n" + "=" * 70)
-    print("Graph creation completed.")
-    print("=" * 70)
-
-    print("\nCreated PNG files:")
-    print("1. Figure_1_Core_Food_Germany_vs_Control_Average.png")
-    print("2. Figure_2_Baseline_Coefficients.png")
-    print("3. Appendix_Figure_A1_Core_Food_Germany_vs_Austria.png")
-    print("4. Appendix_Figure_A2_Category_Specific_Coefficients.png")
-
+    graph_germany_vs_controls(country_month)
+    graph_baseline_coefficients()
+    graph_category_coefficients()
+    graph_germany_vs_austria(country_month)
 
 
 if __name__ == "__main__":
